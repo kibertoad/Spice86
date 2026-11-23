@@ -356,10 +356,12 @@ and the last N events, so a difference is still detected and its position still 
    (`tests/Spice86.Tests/GeneratedCodeMachineTest.cs:249`), and a register whose write was
    removed as dead is pushed with another value by an emulated callee that saves it. Memory
    below the stack pointer is overwritten by the next interrupt in the original as well.
-4. `SVC` inputs are the values of the registers in the service contract's `Reads`
-   (`src/Spice86.Core/Emulator/InterruptHandlers/Common/Contracts/InterruptServiceEntry.cs`),
-   with the stack pointer normalized to the caller's value. A service with an unknown contract
-   compares all registers.
+4. `SVC` compares the vector, the selector and the bound inputs the event carries (section 5.1).
+   For an entry that binds no implementation both runs reach the service through the stub, and
+   the registers in the contract's `Reads`
+   (`src/Spice86.Core/Emulator/InterruptHandlers/Common/Contracts/InterruptServiceEntry.cs`)
+   are compared instead, with the stack pointer normalized to the caller's value. A service with
+   an unknown contract compares all registers.
 5. `CALL` compares the target and SS:SP. Registers are compared for the callee's inputs when the
    manifest lists them, and for all registers otherwise.
 6. `END` compares the address, SS and SP. A register or flag in the method's outputs must be
@@ -388,7 +390,7 @@ outcome and returns it (section 5.2). After the cases of a function have run, th
 the hits and reports, per function:
 
 - branch outcomes no case produced, each with its site id, the address of the instruction it came
-  from and the printed condition;
+  from (none for a synthetic site, section 5.2) and the printed condition;
 - `switch` values no case selected;
 - arms that end in `throw FailAsUntested`. Discovery never took these, so cases from the same
   recording cannot reach them. They are listed apart.
@@ -456,24 +458,50 @@ public interface IServiceCallObserver {
 
 public readonly record struct ServiceCall(
     byte Vector, int? Selector, InterruptServiceEntry Entry, bool Direct,
-    IReadOnlyList<(CpuValues Register, uint Value)> Inputs);
+    IReadOnlyList<ServiceCallInput> Inputs);
+
+public readonly record struct ServiceCallInput(CpuValues Binding, uint Value);
 ```
 
-- `InterruptHandler.Run(int index)` raises the event for handlers that dispatch on a selector.
-  A handler with a single service raises it from the callback that `WriteAssemblyInRam`
-  registers. The exact place for single-service handlers with their own stub is to be settled
-  in the pull request.
-- For a direct call, the check build prints a notification before the call with the same
-  argument expressions: `ServiceCalled(0x21, 0x3F, 0, 1, DS, 0x0120);`. `CSharpOverrideHelper`
-  maps the arguments to registers through `InterruptServiceEntry.Inputs` and raises the same
-  event. The printed arguments are register reads, constants and string decodes, which have no
-  effect when evaluated twice (`doc/codeGeneratorReadme.md:295`).
+`InstalledInterruptHandlers.ServiceCallObserver` holds the observer. The event is raised before
+the service runs.
+
+- **Inputs.** The event carries the value of each input the entry binds to its implementation
+  (`InterruptServiceEntry.Inputs`), encoded by width as `ServiceCallInputs.Read` describes. It
+  does not carry a register snapshot: a direct call loads no input register, so a snapshot would
+  differ between the two forms of the same call. An entry that binds no implementation has no
+  direct form and an empty `Inputs`. It is only reached through the stub, where an observer can
+  read the registers of the contract from the CPU state.
+- **Stub and `InterruptCall` forms.** `InterruptHandler.Run(int index)` raises the event for a
+  handler that selects between services. A handler with a single service raises it from
+  `InterruptHandler.RunServiceFromStub`, the callback of the default stub and of the INT 25h and
+  INT 26h stubs. `CallbackDescriptions` describes it like `Run`, so callback comments in
+  generated code do not change. INT 16h AH=00h and AH=10h raise it from
+  `KeyboardInt16Handler.CallbackDequeueAndSetAx`, because their stub never calls `Run(int)`.
+  INT 21h AH=0Ch raises two events, one for 0Ch and one for the input function in AL that it
+  dispatches.
+- **Direct form.** The generator option `ServiceCallNotifications` (section 5.2) prints
+  `ServiceCalled(vector, selector, inputs);` before each direct call, with the call's own argument
+  expressions as inputs. For INT 21h it comes after the `RecordCallerStack` line, because through
+  the stub `DosInt21Handler.Run()` saves the caller stack before `Run(int)` raises the event.
+  `CSharpOverrideHelper.ServiceCalled` looks up the entry and raises the event with
+  `Direct = true`. The printed arguments are register reads, constants and string decodes, which
+  have no effect when evaluated twice (`doc/codeGeneratorReadme.md:295`). This option, the
+  `GeneratorOptions` record and `--GeneratedCodeCheckBuild` come with this change, because without
+  the notification the two forms of a call cannot be compared.
+- **No event.** Handlers on the hardware interrupt vectors (INT 08h to 0Fh and 70h to 77h with
+  the default PIC bases) do not get the observer. INT 09h and INT 70h derive from
+  `InterruptHandler`, and their stubs would otherwise report every IRQ 1 and IRQ 8. An IRQ
+  handler runs on an external event at a time the program does not choose, so it is not a
+  service call. Handlers that do not derive from `InterruptHandler`, and the bare `iret` stub of
+  INT 1Ch, raise none either. `ServiceCalled` raises an event only for a handler that holds the
+  observer, so the direct form skips the same handlers.
 - The implementing method raises nothing, so a stub that calls its own implementation
   (`DosInt21Handler.cs:1528-1532`) reports once.
 
-**Classes touched.** `InterruptHandler`, `CSharpOverrideHelper`, `CSharpStatementPrinter`
-(the direct call is printed near line 204), `Machine` or `InstalledInterruptHandlers` to hold
-the observer.
+**Classes touched.** `InterruptHandler`, `KeyboardInt16Handler`, `InstalledInterruptHandlers`,
+`CSharpOverrideHelper`, `CSharpStatementPrinter` (the direct call is printed near line 204),
+`CfgCSharpGenerator`, `Configuration`.
 
 **Alternatives.**
 
@@ -483,7 +511,8 @@ the observer.
 | Execution breakpoints on the callback addresses (`Callback.InstructionAddress`) plus a source rewrite for direct calls | Works without a core change. The rewrite depends on the printed text. |
 | A notification inside each implementing method | Covers hand-written callers too. Touches every service method, and a stub would report twice unless guarded. |
 
-**Risk.** Performance: one null check per service call. Determinism: none, the observer only
+**Risk.** Performance: one null check per service call. With the option on, each direct call
+costs one more method call with an array for its inputs. Determinism: none, the observer only
 reads. Generated output is unchanged when the option is off.
 
 **Later extension.** Replacing a service by its recorded effects, so that file I/O reproduces.
@@ -497,46 +526,82 @@ one place for dumps (`src/Spice86/Spice86DependencyInjection.cs:500`). Statement
 the test project as a Roslyn rewrite (`tests/Spice86.Tests/GeneratedCodeProbes.cs:89-109`), and
 Spice86.Core does not reference Roslyn.
 
-**Proposal.** An options record replaces the booleans:
+**Proposal.** An options record holds the switches. The existing `CfgCSharpGenerator`
+constructors stay.
 
 ```csharp
 public sealed record GeneratorOptions {
+    public static GeneratorOptions Default { get; } = new();
+    public static GeneratorOptions CheckBuild { get; } = new() {
+        ServiceCallNotifications = true, BranchProbes = true,
+        DeviceOperations = false, Manifest = true
+    };
     public bool CollectCensuses { get; init; }
     public bool Verify { get; init; }
-    public bool BranchProbes { get; init; }
     public bool ServiceCallNotifications { get; init; }
+    public bool BranchProbes { get; init; }
     public bool DeviceOperations { get; init; } = true;
     public bool Manifest { get; init; }
 }
 ```
 
-A `--GeneratedCodeCheckBuild` option sets the last four for the dump.
+`--GeneratedCodeCheckBuild` selects `GeneratorOptions.CheckBuild` for the dump. The record, the
+command line option and `ServiceCallNotifications` come with the service call event (section
+5.1). The other three options follow.
 
-- **Branch probes.** A pass over the structured method AST, after structuring and before
-  printing, wraps the condition of each `IfElseNode`, `WhileNode`, `DoWhileNode`,
-  `PreTestLoopNode` and `ConditionalValueNode` in `Branch(site, condition)` and the value of each
-  `SwitchNode` in `Selector(site, value)`. Both are methods of `CSharpOverrideHelper` that record
-  and return their argument. A condition combined from several instructions gets one probe per
-  operand. Running the pass on the final AST leaves every earlier pass with the same input, so
-  the check build's methods differ from the shipped ones by the wrappers only.
+- **Branch probes.** The two printers write the probe at the point where they print a condition,
+  so the AST keeps its shape and the default build prints the same text by the same calls. The
+  condition of each `if`, `else if`, `while`, `do ... while`, `for` and conditional expression
+  prints as `Branch(site, condition)`, and the value of each `switch` as
+  `Selector(site, value)`. Both are methods of `CSharpOverrideHelper` that report to
+  `Machine.BranchProbeObserver` (an `IBranchProbeObserver`) and return their argument.
+  `Selector` is generic over the integer type, so a `switch` keeps its governing type and its
+  case labels. A condition joined with `&&` or `||` gets one probe per operand, in the same order
+  and with the same short circuit (`CSharpExpressionPrinter.ProbedCondition`). An operand that
+  prints as the constant `true` or `false` gets no probe: it has one outcome, and a probe would
+  hide the constant from the C# compiler's reachability analysis. The entry dispatch
+  `switch (loadOffset)` of a method with several entries is not probed.
+- **Site numbers.** `BranchProbeSites` numbers sites in print order, so the same program gets
+  the same numbers on every generation. A printer can print an expression and drop the text; that
+  probe keeps its number and is absent from source and manifest, so numbers can have gaps. Two
+  prints of one conditional expression get different site numbers, so a printer rewrite that
+  compares printed text (compound assignment, for example) can miss in a check build. That
+  changes the shape of the check build's source, not what it computes.
+- **Site origins.** Each site records the instruction that decides it: the conditional jump
+  (Jcc, JCXZ, LOOP/LOOPcc) of a two-way branch, the indirect jump or call of a `switch`, or the
+  instruction whose own condition it is (`setcc`, `salc`, `bsf`, `daa`, `cmpxchg`, a `rep`
+  string instruction). The origin is held in `ValueNode.BranchOrigin`, which takes no part in
+  node equality. In a check build `IrMethodEmitter` stamps each conditional value after the lift
+  and each branch condition, switch value and exit transfer condition after the last IR pass,
+  from the instruction of its terminator. `IrIfConversion`, `IrWideComparisons`, the negation
+  and constant folding helpers and `SingleCaseSwitchRewriter` carry the origin to the conditions
+  they build. A site that no single instruction decides is synthetic and has no address: a
+  32-bit comparison packed from several jumps, a conditional value a pass builds from no branch,
+  a node shared by the conditions of two instructions.
 - **Service call notifications.** Section 5.1.
-- **Device operations.** When off, `IrDeviceOperations` is skipped and every port access prints
-  as a single access. This is the one place where a check build's code differs from the shipped
-  code in more than added calls. The pass is a late rewrite inside one block
+- **Device operations.** When off, `IrMethodEmitter` runs the pass pipeline with an empty port
+  map, so `IrDeviceOperations` combines nothing and every port access prints on its own.
+  Single-port wrappers still print. This is the one place where a check build's code differs
+  from the shipped code in more than added calls. The pass is a late rewrite inside one block
   (`IrDeviceOperations.cs:28-29,46-47`), and the report names the methods it would have changed.
-- **Manifest.** A JSON file next to the generated sources: per method its name, entry addresses
-  with the segment field each uses, the entry offsets of a multi-entry method, the registers
-  behind parameters and return values, the inputs, outputs and changes sets, and its probe sites
-  with kind, instruction address and printed text.
+- **Manifest.** `GeneratedCSharpProgram.Manifest` holds a `GeneratedCodeManifest`, which
+  `CfgCSharpDumper` writes as `manifest.json` next to the sources. Per method: its name, its
+  entry addresses, its typed parameters and outputs with the register each stands for, and its
+  probe sites with number, kind, printed text and the address of the deciding instruction, or
+  `synthetic: true`. It lists only the sites whose probe is present in the source. The segment
+  field of each entry and the inputs, outputs and changes sets of each method are added with the
+  redirect subclass (M9), their first user.
 
-**Classes touched.** `CfgCSharpGenerator`, `IrMethodEmitter` or `MethodBodyEmitter` for the new
-pass, the pass pipeline, `CSharpStatementPrinter`, `CSharpOverrideHelper`, `CfgCSharpDumper`,
-`Configuration`, `Spice86DependencyInjection`.
+**Classes touched.** `CfgCSharpGenerator`, `IrMethodEmitter`, `IrIfConversion`,
+`IrWideComparisons`, `CSharpStatementPrinter`, `CSharpExpressionPrinter`, `ValueNode`,
+`CSharpOverrideHelper`, `Machine`, `CfgCSharpDumper`, `Configuration`,
+`Spice86DependencyInjection`.
 
 **Alternatives.**
 
 | alternative | trade-off |
 |---|---|
+| A pass over the structured AST that wraps conditions before printing | One place for the probes. Every step after the pass sees the wrappers, and the AST changes shape between the default and the check build. Printing the probe where the condition is printed needs neither. |
 | Probes inserted in the IR before structuring | Coverage maps to CFG edges. The probes change what the structuring passes see, so `ConditionCombiner` and `IrIfConversion` produce different code than in the shipped build. |
 | The Roslyn rewrite of the tests, moved to a tool | No generator change. Needs Roslyn where the checker runs, probes statements instead of branch outcomes, and breaks when the printed shapes change. |
 | Coverage taken from the emulated run's executed instructions | No generator change. It measures the original's branches. It cannot see a branch the generator merged or removed. |
@@ -560,11 +625,39 @@ one that waits for an interrupt handler to change memory, one that reads planar 
 one whose service calls read device state. Everything else is checked without this change, which
 is why it comes last in the plan.
 
-**Proposal.** Each device gets a pair `TState CaptureState()` and `void RestoreState(TState)`
-over an immutable record, starting from the two existing records. A `Machine` method captures and
-restores a chosen set. Order of work: PIC, then PIT with the scheduler entries it owns
-(`src/Spice86.Core/Emulator/VM/DeviceScheduler/DeviceScheduler.cs:61`), then VGA registers and
-planes. Sound Blaster and DMA follow only if cases need them.
+**Proposal.** A device implements one interface over an immutable record that holds everything
+the device needs to behave after a restore as it did at capture:
+
+```csharp
+public interface IStatefulDevice<TState> {
+    TState CaptureState();
+    void RestoreState(TState state);
+}
+```
+
+Capture changes nothing. A device restores only itself, and restore replaces the scheduler events
+the device owns. Times are stored with the emulated clock's time at capture and moved by the time
+passed since on restore. This works both when the caller also restores `State.Cycles` under the
+cycle clock (the move is then zero) and when the clock has moved on.
+
+The state records are new: `DualPicState` with two `PicControllerState`, and `PitTimerState` with
+three `PitChannelState`. The existing `PicSnapshot` and `PitChannelSnapshot` leave out state a
+restore needs (the ICW sequence position, the command port read selection and the priority
+rotation of the PIC; the access modes, `CounterStatusSet` and `UpdateCount` of the PIT), and
+adding parameters to those public positional records would break their callers. They stay as
+read-only views.
+
+`Machine.CaptureDeviceState(MachineDevices)` returns a `MachineDeviceState` with one member per
+covered device, `null` for a device left out, and `Machine.RestoreDeviceState` restores the
+members that are set. The PIT captures the delay to its channel 0 event through
+`DeviceScheduler.GetNextEventTime(handler)`
+(`src/Spice86.Core/Emulator/VM/DeviceScheduler/DeviceScheduler.cs:61`). `DualPic.RestoreState`
+raises `IrqMaskChanged` for each line whose mask changes. The PIT leaves the IRQ 0 line to the
+PIC's state and does not tell the PC speaker about channel 2.
+
+Order of work: PIC and PIT first, then VGA registers and planes. Sound Blaster, DMA and the other
+devices follow only if cases need them; each implements `IStatefulDevice<TState>` and gets a
+member in `MachineDeviceState`.
 
 **Alternatives.**
 
@@ -584,13 +677,28 @@ affects. No cost when unused.
 `CheckExternalEvents` (`CSharpOverrideHelper.cs:1546-1553`). Both call
 `DualPic.ComputeVectorNumber` (`DualPic.cs:187-209`).
 
-**Proposal.** `DualPic` gets a hold: `IDisposable HoldDelivery()`. While held,
-`ComputeVectorNumber` returns `null` before it reads or clears `IrqCheck`, so requests stay
-pending, and it records the cycle, CS:IP and line of each request it would have delivered. That record is
-the answer to "where does the original enable interrupts": a case with suppressed deliveries is
-one the original could have been interrupted in. The same hold makes `CheckExternalEvents` skip
-its input and scheduler pumping (`CSharpOverrideHelper.cs:1543-1545`), so the generated run sees
-the same absence of device events as a driver loop around `ExecuteNext`.
+**Proposal.** `DualPic` gets a hold: `InterruptDeliveryHold HoldDelivery()`, a disposable that
+carries its own record of held requests. While at least one hold is active,
+`ComputeVectorNumber` returns `null` and changes no controller state. The hold test comes after
+the existing `!IrqCheck` test, so the common path with no pending request pays nothing, and
+`IrqCheck` is only read: requests stay latched and `IrqCheck` stays set. Devices still raise and
+lower lines, and the program can still program the controllers through their ports.
+
+Each hold lists the requests the CPU asked for and did not get as `HeldInterruptDelivery`
+entries: IRQ line, vector, cycle count and CS:IP of the first time the CPU asked. The CPU asks
+only with the interrupt flag set and no interrupt shadow, and it asks once per instruction or
+block, so a line is listed once per hold while its request stays latched, and again after it is
+lowered and raised. That record is the answer to "where does the original enable interrupts": a
+case with held deliveries is one the original could have been interrupted in. Holds nest, and
+each keeps its own record. A hold keeps 1024 entries and counts the rest in
+`DroppedDeliveryCount`. `DualPic.IsDeliveryHeld` tells whether a hold is active. Delivery
+resumes when the last hold is disposed.
+
+The same hold makes `CheckExternalEvents` skip its input and scheduler pumping
+(`CSharpOverrideHelper.cs:1543-1545`), so the generated run sees the same absence of device
+events as a driver loop around `ExecuteNext`. Cycle breakpoints still fire. `EmulationLoop.RunLoop`
+still pumps input and device events under a hold; only delivery to the CPU is held there. A CPU
+halted by `hlt` stays halted under a hold.
 
 **Classes touched.** `DualPic`, `CSharpOverrideHelper`.
 
@@ -650,8 +758,8 @@ manifest and pinned by fixtures in Spice86's test suite, so a generator change t
 checker fails in Spice86's CI. If the maintainers want
 the checker inside, the move is a namespace change once its formats have settled.
 
-**The smallest core subset that lets the checker live outside:** the generator option of 5.2,
-including the direct service call notification of 5.1, plus the port interceptor of 5.6. With
+**The smallest core subset that lets the checker live outside:** the service call event of 5.1
+with its direct call notification, the generator option of 5.2, and the port interceptor of 5.6. With
 those three an outside checker handles every call that returns to its call site. 5.5 adds
 redirected returns and unwinds. 5.4 adds the suppressed delivery record. 5.3 adds the functions
 that depend on interrupts and planar video.
@@ -678,7 +786,8 @@ that depend on interrupts and planar video.
 
 ## 8. Implementation plan
 
-Each milestone is one pull request with its tests. M1 to M5 change Spice86. M6 to M11 are the
+Each milestone is one pull request with its tests, except M4, which is two. M1 to M5 change
+Spice86. M6 to M11 are the
 checker and apply wherever it lives.
 
 Tests build on what the repository has: assembly sources in
@@ -694,9 +803,9 @@ sources through `GeneratedOverrideCompiler.CompileSupplier`, as
 | milestone | content | tests |
 |---|---|---|
 | M1 Fixtures | Four assembly fixtures, each calling its function several times with different inputs: `check_leaf` (register and memory results, one conditional branch), `check_callee` (near and far callees, one `ret n`), `check_ports` (reads and writes on a latch port, as `ioports` does with `LatchIoPortHandler`), `check_dos` (one service that prints a direct call and one that keeps `InterruptCall`). | Each joins the generated catalogue, so `GeneratedCodeMachineTestRunner` checks its oracle, its machine goldens and its generated source golden. `GeneratedCodeDifferentialReport` reports each as identical. |
-| M2 Service call event | `IServiceCallObserver` and its two raise points for emulated and stub calls. | On `int_service_calls` and `check_dos`: one event per executed `int`, with the same sequence in the emulated run and the override run for sites that keep `InterruptCall`. A unit test that a stub calling its implementation reports once. |
-| M3 Generator options | `GeneratorOptions`, branch probes, service call notification for direct calls, the device operation switch, the manifest, the command line option. | All existing goldens unchanged with the option off. New goldens for the check build of the four fixtures. A test that every `Branch` site of a check build is listed in the manifest. A test on `check_dos` that the emulated and override runs give equal service event sequences, direct call included. A test on `cmos_ports` that a check build prints no device call. A port of `GeneratedCodeProbesTest` to the new probes. |
-| M4 Port interception and interrupt hold | The dispatcher interceptor and `DualPic.HoldDelivery`. | `IOPortDispatcherTests`: an interceptor answers reads and consumes writes for registered and unregistered ports, and removal restores the old behaviour. On `externalint.pit`: under the hold no handler runs in the emulated and the override run, the suppressed delivery is recorded, and the request is delivered after release. |
+| M2 Service call event | `IServiceCallObserver` and its raise points for stub and `InterruptCall` calls, the `ServiceCalled` notification for direct calls, `GeneratorOptions` with `ServiceCallNotifications`, the command line option. | All existing goldens unchanged with the option off. On `int_service_calls`: one event per executed `int`. On a fixture with direct calls and `InterruptCall` sites: the emulated run and the check build give equal service event sequences, direct calls included. Hardware interrupt vector handlers raise no event. A stub calling its implementation reports once. |
+| M3 Generator options | Branch probes, the device operation switch, the manifest. | All existing goldens unchanged with the options off. New goldens for the check build of the four fixtures. A test that every `Branch` site of a check build is listed in the manifest, and that every site address is the instruction that decides it. A test on `device_operations` that a check build prints no device call. A port of `GeneratedCodeProbesTest` to the new probes. |
+| M4 Interrupt hold and port interception | Two pull requests: `DualPic.HoldDelivery`, then the dispatcher interceptor. | On `externalint`: under the hold no handler runs in the emulated and the override run, the held delivery is recorded, and the request is delivered after release. `IOPortDispatcherTests`: an interceptor answers reads and consumes writes for registered and unregistered ports, and removal restores the old behaviour. |
 | M5 Call and return observer | The two observer methods on `FunctionHandler`. | On `cc_stack_frames`, `redirectedreturn` and `callstackunwind`: the observer reports aligned returns, a `ret n`, a redirected return and an unwind where each fixture performs one. |
 | M6 Event log and comparison | Record format, the rules of section 4.7, verdicts. No emulator dependency. | Unit tests on synthetic logs, one per rule: a reordered far return push agrees, an overwritten value disagrees, a frame region difference is a note, a register outside the outputs is a note and a difference in strict mode. |
 | M7 Recorder and case store | Case capture, selection, page store. | On `check_leaf`: the expected number of cases, a round trip through the store, and a store size that grows by changed pages only. A header mismatch is refused. |
@@ -704,7 +813,7 @@ sources through `GeneratedOverrideCompiler.CompileSupplier`, as
 | M9 Generated run | The redirect subclass, the generated run, E against G. | The four fixtures agree. Mutants of each fixture's generated source, compiled with `CompileSupplier`, disagree at the expected event: a changed constant, a removed memory write, two swapped port writes, a changed service selector, a callee called with a wrong argument. A mutant inside a callee does not make the caller disagree. `callstackunwind` ends through the unwind path. |
 | M10 Coverage and reports | Probe hits, the TSV and JSON files, the command line options, exit codes. | On `check_leaf` with a case set that takes one side of its branch only: the other outcome is reported with its instruction address. Report files compared with goldens. |
 | M11 MCP tools | The four tools of section 4.9. | Tests in the style of `McpServerToolStateTests` against a case store of `check_callee`. |
-| M12 Device snapshots (optional) | PIC and PIT capture and restore. | Capture, change through ports, restore, compare with the first capture. A fixture whose function waits for a timer tick, checked once interrupts can be delivered at recorded points. |
+| M12 Device snapshots (optional) | PIC and PIT capture and restore. | Capture, change through ports, restore, compare with the first capture. A restored PIT event raises IRQ 0 once its delay has passed. A fixture whose function waits for a timer tick belongs to the work that delivers interrupts at recorded points, which this plan does not schedule yet. |
 | M13 Service replay (optional) | Skipping a service and applying its recorded effects. | A fixture that reads a file twice reproduces. |
 
 ## 9. Open questions for the maintainers
@@ -736,10 +845,6 @@ sources through `GeneratedOverrideCompiler.CompileSupplier`, as
   precondition than `SignalEntry` (`CfgCpu.cs:197-204`) and the context reset of section 4.4.
 - That `CfgCpu.Clear()` is safe to call between cases.
 - The size estimates of section 4.3.
-- That the final method AST is the right place for the probe pass, and that wrapping a condition
-  disturbs no later step such as label placement. The node types were read; the passes after
-  structuring were not.
-- Where a handler with a single service and its own stub should raise the service event.
 - That no generated statement writes memory or a port by a path other than the `Memory` indexers
   and `IOPortDispatcher`, apart from device operations. The helper methods and several goldens
   were read; the whole printer was not.
