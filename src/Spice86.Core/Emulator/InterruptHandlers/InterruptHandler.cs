@@ -41,6 +41,7 @@ public abstract class InterruptHandler : IndexBasedDispatcher<IRunnable>, IInter
     private IEmulatorLoggerState _loggerState = new Spice86LoggerState();
     private readonly InterruptServiceDeclarations _declarations;
     private HandlerServices? _services;
+    private readonly ServiceCallEvents _serviceCallEvents;
 
     /// <summary>
     /// Initializes a new instance.
@@ -49,9 +50,11 @@ public abstract class InterruptHandler : IndexBasedDispatcher<IRunnable>, IInter
     /// <param name="functionHandlerProvider">Provides current call flow handler to peek call stack.</param>
     /// <param name="stack">The CPU stack.</param>
     /// <param name="state">The CPU state.</param>
+    /// <param name="serviceCallEvents">The service call events the handler reports its service calls to.</param>
     /// <param name="loggerService">The logger service implementation.</param>
-    protected InterruptHandler(IMemory memory, IFunctionHandlerProvider functionHandlerProvider, Stack stack, State state, ILogger loggerService)
-        : this(memory, functionHandlerProvider, stack, state, loggerService, ServiceSelector.Ah) {
+    protected InterruptHandler(IMemory memory, IFunctionHandlerProvider functionHandlerProvider, Stack stack, State state,
+        ServiceCallEvents serviceCallEvents, ILogger loggerService)
+        : this(memory, functionHandlerProvider, stack, state, serviceCallEvents, loggerService, ServiceSelector.Ah) {
     }
 
     /// <summary>
@@ -61,11 +64,13 @@ public abstract class InterruptHandler : IndexBasedDispatcher<IRunnable>, IInter
     /// <param name="functionHandlerProvider">Provides current call flow handler to peek call stack.</param>
     /// <param name="stack">The CPU stack.</param>
     /// <param name="state">The CPU state.</param>
+    /// <param name="serviceCallEvents">The service call events the handler reports its service calls to.</param>
     /// <param name="loggerService">The logger service implementation.</param>
     /// <param name="serviceSelector">The register used to select a service.</param>
     protected InterruptHandler(IMemory memory, IFunctionHandlerProvider functionHandlerProvider, Stack stack, State state,
-        ILogger loggerService, ServiceSelector serviceSelector) : base(state, loggerService) {
+        ServiceCallEvents serviceCallEvents, ILogger loggerService, ServiceSelector serviceSelector) : base(state, loggerService) {
         Memory = memory;
+        _serviceCallEvents = serviceCallEvents;
         FunctionHandlerProvider = functionHandlerProvider;
         Stack = stack;
         ServiceSelector = serviceSelector;
@@ -119,10 +124,39 @@ public abstract class InterruptHandler : IndexBasedDispatcher<IRunnable>, IInter
 
         // Write ASM
         SegmentedAddress interruptHandlerAddress = memoryAsmWriter.CurrentAddress;
-        memoryAsmWriter.RegisterAndWriteCallback(VectorNumber, Run);
+        memoryAsmWriter.RegisterAndWriteCallback(VectorNumber, RunServiceFromStub);
         memoryAsmWriter.WriteIret();
 
         return interruptHandlerAddress;
+    }
+
+    /// <summary>
+    /// The callback of a stub whose only C# step is <see cref="Run()"/>. Tells the service call observer
+    /// about the call when the handler has a single service, then runs it. A handler that selects between
+    /// services tells the observer from <see cref="Run(int)"/>, once it knows the selector value.
+    /// A handler that writes its own stub registers this method where it would register <see cref="Run()"/>.
+    /// </summary>
+    protected void RunServiceFromStub() {
+        if (_serviceCallEvents.ObserverFor(VectorNumber) is { } observer && _declarations.SingleService is { } single) {
+            observer.OnServiceCall(new ServiceCall(VectorNumber, null, single.Entry, false,
+                ServiceCallInputs.ReadAll(State, single.Entry)));
+        }
+        Run();
+    }
+
+    /// <summary>
+    /// Tells the service call observer, when there is one, that the service selected by
+    /// <paramref name="index"/> is about to run. <see cref="Run(int)"/> calls it. A stub callback that runs
+    /// a service without going through <see cref="Run(int)"/> calls it itself.
+    /// </summary>
+    /// <param name="index">The selector value of the service.</param>
+    protected void NotifyServiceCall(int index) {
+        if (_serviceCallEvents.ObserverFor(VectorNumber) is not { } observer) {
+            return;
+        }
+        InterruptServiceEntry entry = _serviceEntries.GetValueOrDefault(index) ?? InterruptServiceEntry.Unknown;
+        observer.OnServiceCall(new ServiceCall(VectorNumber, index, entry, false,
+            ServiceCallInputs.ReadAll(State, entry)));
     }
 
     /// <summary>
@@ -151,6 +185,7 @@ public abstract class InterruptHandler : IndexBasedDispatcher<IRunnable>, IInter
         // By default Log the CS:IP of the caller which is more useful in most situations
         SegmentedAddress? csIp = FunctionHandlerProvider.FunctionHandlerInUse.PeekReturnAddressOnMachineStack(CallType.INTERRUPT);
         _loggerState.CsIp = csIp ?? _loggerState.CsIp;
+        NotifyServiceCall(index);
         base.Run(index);
     }
 
