@@ -107,6 +107,13 @@ public sealed class Machine : IDisposable {
     public InstalledInterruptHandlers InstalledInterruptHandlers { get; }
 
     /// <summary>
+    /// The observer told about the outcome of every branch probe generated code runs, or
+    /// <see langword="null"/> (the default) for none. Only generated code produced as a check build contains
+    /// probes. Set it on the emulation thread, or while the emulation is paused.
+    /// </summary>
+    public Spice86.Core.Emulator.ReverseEngineer.IBranchProbeObserver? BranchProbeObserver { get; set; }
+
+    /// <summary>
     /// INT16H handler.
     /// </summary>
     public KeyboardInt16Handler KeyboardInt16Handler { get; }
@@ -342,6 +349,45 @@ public sealed class Machine : IDisposable {
         InputEventHub = inputEventHub;
         EmulationLoopScheduler = emulationLoopScheduler;
         InstalledInterruptHandlers = installedInterruptHandlers;
+    }
+
+    /// <summary>
+    /// Captures the state of the chosen devices, so that <see cref="RestoreDeviceState"/> can put them back
+    /// later. Registers and memory are not part of it.
+    /// </summary>
+    /// <remarks>
+    /// Covered devices: the interrupt controllers and the programmable interval timer. DMA, VGA, Sound Blaster
+    /// and the other devices are not covered. Call this on the emulation thread between two instructions, or
+    /// while the emulation is paused.
+    /// </remarks>
+    /// <param name="devices">Devices to capture.</param>
+    /// <returns>The captured state, with a <c>null</c> member for each device left out.</returns>
+    public MachineDeviceState CaptureDeviceState(MachineDevices devices = MachineDevices.All) {
+        DualPicState? pic = null;
+        if ((devices & MachineDevices.Pic) != 0) {
+            pic = DualPic.CaptureState();
+        }
+        PitTimerState? pit = null;
+        if ((devices & MachineDevices.Pit) != 0) {
+            pit = Timer.CaptureState();
+        }
+        return new MachineDeviceState(pic, pit);
+    }
+
+    /// <summary>
+    /// Restores the devices a captured state holds, and leaves the others as they are.
+    /// </summary>
+    /// <remarks>
+    /// Call this on the emulation thread between two instructions, or while the emulation is paused.
+    /// </remarks>
+    /// <param name="state">State captured by <see cref="CaptureDeviceState"/>.</param>
+    public void RestoreDeviceState(MachineDeviceState state) {
+        if (state.Pic is { } pic) {
+            DualPic.RestoreState(pic);
+        }
+        if (state.Pit is { } pit) {
+            Timer.RestoreState(pit);
+        }
     }
 
     /// <summary>
